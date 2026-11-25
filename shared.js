@@ -1,4 +1,8 @@
-const SDK_URL = 'https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.89.0/+esm';
+import {downloadEventCalendar, eventHasTime, formatEventDate} from './calendar.js';
+
+import { downloadWorkspaceBackup, readWorkspaceBackup } from './workspace-backup.js';
+
+const SDK_URL = './vendor/supabase.js';
 const BUCKET = 'partyhub-media';
 const MAX_MEDIA_BYTES = 50 * 1024 * 1024;
 const MEDIA_TYPES = ['image/jpeg', 'image/png', 'image/webp', 'image/gif', 'image/avif', 'video/mp4', 'video/webm'];
@@ -55,6 +59,25 @@ function sortedSongs(songs) {
   return [...songs].sort((a, b) => Number(b.votes) - Number(a.votes));
 }
 
+function countLabel(count, label) {
+  return `${count} ${label}${count === 1 ? '' : 's'}`;
+}
+
+function formIsDirty(form) {
+  return Array.from(form.elements).some((control) => {
+    if (control instanceof HTMLInputElement) {
+      if (control.type === 'checkbox') return control.checked !== control.defaultChecked;
+      if (control.type === 'file') return control.files.length !== 0;
+      return control.value !== control.defaultValue;
+    }
+    if (control instanceof HTMLSelectElement) {
+      const initial = Array.from(control.options).find((option) => option.defaultSelected) ?? control.options[0];
+      return control.value !== initial?.value;
+    }
+    return control instanceof HTMLTextAreaElement && control.value !== control.defaultValue;
+  });
+}
+
 function timelineRows(timeline, canEdit) {
   return [...timeline].sort((a, b) => a.time.localeCompare(b.time)).map((item) =>
     `<div class="item"><time>${escape(item.time)}</time><strong class="grow">${escape(item.name)}</strong>
@@ -63,7 +86,8 @@ function timelineRows(timeline, canEdit) {
 }
 
 function eventHero(event, label) {
-  const summary = [event.date, event.time, event.venue].filter(Boolean).map(escape).join(' · ');
+  const summary = [formatEventDate(event), eventHasTime(event) ? event.time : '', event.venue]
+    .filter(Boolean).map(escape).join(' · ');
   return `<header class="hero"><div class="eyebrow">${label}</div><h1>${escape(event.name)}</h1>
     ${summary ? `<p>${summary}</p>` : ''}</header>`;
 }
@@ -121,7 +145,9 @@ export async function startShared(config) {
   let revision = 0;
   let guest = null;
   let hostEmail = '';
-  let hostTab = 'event';
+  let hostTab = 'overview';
+  let householdQuery = '';
+  let householdStatus = '';
   let busy = false;
   let media = [];
   let mediaUnavailable = false;
@@ -130,6 +156,12 @@ export async function startShared(config) {
   function notify(message) {
     const status = app.querySelector('#shared-status');
     if (status) status.textContent = message;
+  }
+
+  function confirmDrafts(except) {
+    const dirty = Array.from(app.querySelectorAll('[data-shared-form]'))
+      .some((form) => form !== except && formIsDirty(form));
+    return !dirty || window.confirm('Discard unsaved changes?');
   }
 
   function layout(content, extra = '') {
@@ -174,11 +206,15 @@ export async function startShared(config) {
       ${song.voted ? '<span class="pill">Voted</span>' : button('Vote', 'vote', song.id)}
     </div>`).join('')) : '';
     const karaoke = safeLink(event.karaoke);
+    const calendar = formatEventDate(event) ? `<div class="shared-calendar">
+      ${button('Add to calendar', 'calendar')}
+      ${eventHasTime(event) ? '<p class="muted">The calendar file uses your device time zone.</p>' : ''}</div>` : '';
     layout(`<div class="guest">${eventHero(event, 'Private invitation')}
       ${section(`Welcome, ${escape(household.name)}`,
         `${event.details ? `<p class="shared-details">${escape(event.details)}</p>` : ''}
         ${household.table ? `<p>Your table is <strong>${escape(household.table)}</strong>.</p>` : ''}
-        ${karaoke ? `<p><a href="${escape(karaoke)}" target="_blank" rel="noopener noreferrer">Karaoke sign-up</a></p>` : ''}`)}
+        ${karaoke ? `<p><a href="${escape(karaoke)}" target="_blank" rel="noopener noreferrer">Karaoke sign-up</a></p>` : ''}
+        ${calendar}`)}
       ${rsvp}${music}${timeline.length ? section('Schedule', timelineRows(timeline, false)) : ''}
     </div>`);
   }
@@ -187,7 +223,12 @@ export async function startShared(config) {
     const add = form('add-guest', field('Household name', 'name', '', 'required maxlength="120"') +
       field('Party size', 'count', 1, 'type="number" min="1" max="100" required') + '<button>Add household</button>');
     const rows = state.guests.map((household) =>
-      `<article class="card section"><h3>${escape(household.name)}</h3>
+      `<details class="shared-household" data-household-id="${escape(household.id)}" data-household-status="${escape(household.status)}">
+      <summary><strong data-household-name>${escape(household.name)}</strong>
+        <span class="muted">${countLabel(Number(household.count), 'guest')}${household.table ? ` · Table ${escape(household.table)}` : ''}</span>
+        <span class="pill" data-rsvp="${escape(household.status)}">${escape(STATUS[household.status])}</span>
+      </summary>
+      <div class="shared-household-edit">
       ${form('edit-guest', field('Household name', 'name', household.name, 'required maxlength="120"') +
         field('Party size', 'count', household.count, 'type="number" min="1" max="100" required') +
         `<label class="field">RSVP<select name="status">${statusOptions(household.status)}</select></label>` +
@@ -198,10 +239,53 @@ export async function startShared(config) {
         ${button('Remove', 'remove-guest', household.id, 'danger')}</div>`, household.id)}
       ${activeInvite?.id === household.id ? `<label class="field">Private invite link
         <input value="${escape(activeInvite.url)}" readonly></label>
-        <p class="muted">Anyone with this link can respond for this household. Creating a fresh link expires the previous one.</p>
-        ${button('Copy link', 'copy')}` : ''}</article>`
-    ).join('') || empty('No households yet.');
-    return section('Add household', add) + rows;
+        <p class="muted">Anyone with this link can respond for this household. Links expire after 180 days, or when replaced or revoked.</p>
+        ${button('Copy link', 'copy')}` : ''}</div></details>`
+    ).join('');
+    const list = `<div class="shared-household-filter">
+      ${field('Search households', 'household-query', householdQuery, 'type="search" data-household-filter aria-controls="household-list"')}
+      <label class="field">RSVP status<select name="household-status" data-household-filter aria-controls="household-list">
+        <option value="">All responses</option>${statusOptions(householdStatus)}</select></label></div>
+      <p class="muted shared-result-count" role="status" data-household-count></p>
+      <div id="household-list">${rows}</div>`;
+    return section('Add household', add) + section('Guest list', list);
+  }
+
+  function filterHouseholds() {
+    const rows = Array.from(app.querySelectorAll('[data-household-id]'));
+    const search = householdQuery.trim().toLocaleLowerCase();
+    let visible = 0;
+    for (const row of rows) {
+      const name = row.querySelector('[data-household-name]').textContent.toLocaleLowerCase();
+      row.hidden = !name.includes(search) || Boolean(householdStatus && row.dataset.householdStatus !== householdStatus);
+      if (!row.hidden) visible++;
+    }
+    app.querySelector('[data-household-count]').textContent = rows.length
+      ? `Showing ${visible} of ${countLabel(rows.length, 'household')}`
+      : 'No households yet.';
+  }
+
+  function showOverview() {
+    const coming = state.guests.filter((household) => household.status === 'yes');
+    const headcount = coming.reduce((total, household) => total + Number(household.count), 0);
+    const pending = state.guests.filter((household) => household.status === 'pending').length;
+    const declined = state.guests.filter((household) => household.status === 'no').length;
+    const queued = state.songs.filter((song) => !song.played).length;
+    const tasks = state.tasks.filter((task) => !task.done).length;
+    const capacity = Number(state.event.capacity);
+    const overflow = headcount - capacity;
+    const size = `<p class="muted">${overflow > 0 ? `${countLabel(overflow, 'guest')} over capacity` : `${capacity} capacity`}</p>`;
+    return `<div class="shared-summary">
+      ${section('Confirmed guests', `<p class="shared-metric">${headcount}</p>${size}
+        <p class="muted">${countLabel(coming.length, 'household')} attending</p>
+        ${button('Manage guest list', 'tab', 'guests')}`)}
+      ${section('Awaiting RSVP', `<p class="shared-metric">${pending}</p><p class="muted">${countLabel(declined, 'household')} declined</p>
+        ${button('See pending replies', 'pending-guests')}`)}
+      ${section('In the song queue', `<p class="shared-metric">${queued}</p>
+        ${button('Open music queue', 'tab', 'music')}`)}
+      ${section('Open tasks', `<p class="shared-metric">${tasks}</p>
+        ${button('Open planning', 'tab', 'planning')}`)}
+    </div>`;
   }
 
   function showMusic() {
@@ -247,9 +331,21 @@ export async function startShared(config) {
     );
   }
 
+  function showEventSettings() {
+    const settings = section('Event settings', form('event', eventFields(state.event) + '<button>Save event</button>'));
+    const backup = revision === 0
+      ? form('import-backup', '<p class="muted">Bring event details, households, songs, and plans from a PartyHub JSON export into this empty workspace.</p>' +
+        '<label class="field">PartyHub backup<input name="backup" type="file" accept=".json,application/json" required></label>' +
+        '<button>Import into workspace</button>')
+      : '<p class="muted">Download a copy of the last saved event details, households, songs, and plans.</p>' +
+        button('Download backup', 'export-backup');
+    return settings + section('Workspace backup', backup + '<p class="muted">Backups contain guest names and RSVP details. Store them privately. Album files and invitation links are excluded.</p>');
+  }
+
   function showHost() {
     const tabs = [
-      ['event', 'Event', () => section('Event settings', form('event', eventFields(state.event) + '<button>Save event</button>'))],
+      ['overview', 'Overview', showOverview],
+      ['event', 'Event', showEventSettings],
       ['guests', 'Guests', showHouseholds],
       ['music', 'Music', showMusic],
       ['planning', 'Planning', showPlanning],
@@ -258,9 +354,17 @@ export async function startShared(config) {
     const nav = tabs.map(([name, label]) => `<button type="button" data-shared-action="tab" data-id="${name}"
       class="${hostTab === name ? 'active' : 'secondary'}" ${hostTab === name ? 'aria-current="page"' : ''}>${label}</button>`).join('');
     const view = tabs.find(([name]) => name === hostTab)[2]();
+    const openHouseholds = new Set(Array.from(app.querySelectorAll('[data-household-id][open]'),
+      (element) => element.dataset.householdId));
     layout(`${eventHero(state.event, 'Host workspace')}<nav aria-label="Workspace" class="actions shared-nav">${nav}</nav>${view}`,
       `<div class="actions"><span class="muted">${escape(user.email)}</span>
-      ${button('Refresh', 'refresh')}${button('Sign out', 'signout')}</div>`);
+      ${button('Refresh event', 'refresh')}${button('Sign out', 'signout')}</div>`);
+    if (hostTab === 'guests') {
+      for (const element of app.querySelectorAll('[data-household-id]')) {
+        element.open = openHouseholds.has(element.dataset.householdId) || activeInvite?.id === element.dataset.householdId;
+      }
+      filterHouseholds();
+    }
   }
 
   async function rpc(name, args = {}) {
@@ -284,9 +388,7 @@ export async function startShared(config) {
       revision = workspace.revision;
     } catch (error) {
       if (error.code !== '40001') throw error;
-      await loadHost();
-      showHost();
-      throw new Error('The event changed on another device. The latest data is loaded. Apply your change again.');
+      throw new Error('The event changed on another device. Copy any unsaved edits, refresh the event, and apply them again.');
     }
     showHost();
     notify('Saved.');
@@ -334,7 +436,9 @@ export async function startShared(config) {
       showAuth();
       return;
     }
-    hostTab = 'event';
+    hostTab = 'overview';
+    householdQuery = '';
+    householdStatus = '';
     await loadHost();
     showHost();
   }
@@ -393,6 +497,13 @@ export async function startShared(config) {
         });
         return;
       }
+      case 'import-backup': {
+        if (revision !== 0) throw new Error('Import is available for an empty workspace.');
+        const backup = await readWorkspaceBackup(values.get('backup'));
+        await saveHost((draft) => Object.assign(draft, backup));
+        notify('Workspace imported.');
+        return;
+      }
       case 'add-guest': {
         const incoming = householdValues(values);
         await saveHost((draft) => draft.guests.push({...incoming, id: crypto.randomUUID(), status: 'pending', table: ''}));
@@ -444,18 +555,31 @@ export async function startShared(config) {
 
   async function act(action, id) {
     switch (action) {
+      case 'export-backup':
+        downloadWorkspaceBackup(state);
+        notify('Workspace backup downloaded.');
+        return;
+      case 'pending-guests':
+        householdQuery = '';
+        householdStatus = 'pending';
+        hostTab = 'guests';
+        showHost();
+        app.querySelector('[aria-current="page"]')?.focus();
+        return;
       case 'tab':
         if (id === 'media') await loadMedia();
         hostTab = id;
         showHost();
         app.querySelector('[aria-current="page"]')?.focus();
         return;
-      case 'refresh':
+      case 'refresh': {
         await loadHost();
         if (hostTab === 'media') await loadMedia();
         showHost();
+        app.querySelector('[data-shared-action="refresh"]')?.focus();
         notify('Up to date.');
         return;
+      }
       case 'signout': {
         const {error} = await client.auth.signOut({scope: 'local'});
         if (error) throw new Error('Could not sign out. Try again.');
@@ -495,6 +619,10 @@ export async function startShared(config) {
       case 'vote':
         await loadGuest('vote', {p_song_id: id});
         notify('Vote saved.');
+        return;
+      case 'calendar':
+        await downloadEventCalendar(guest.event);
+        notify('Calendar file downloaded.');
         return;
       case 'play':
         await saveHost((draft) => {
@@ -543,7 +671,9 @@ export async function startShared(config) {
       await operation();
       if (app.querySelector('#shared-status')?.textContent === 'Working…') notify('');
     } catch (error) {
-      notify(error instanceof Error ? error.message : 'Could not complete the request. Refresh and try again.');
+      const message = error?.code === 'PT429' ? 'Too many changes in a short time. Please wait before trying again.'
+        : error instanceof Error ? error.message : 'Could not complete the request. Refresh and try again.';
+      notify(message);
     } finally {
       busy = false;
       app.removeAttribute('aria-busy');
@@ -554,11 +684,30 @@ export async function startShared(config) {
     const target = event.target.closest('[data-shared-form]');
     if (!target) return;
     event.preventDefault();
+    if (user && !busy && !confirmDrafts(target)) return;
     void run(() => submit(target.dataset.sharedForm, target, target.dataset.id, event.submitter));
+  });
+  app.addEventListener('input', (event) => {
+    const filter = event.target.closest('[data-household-filter]');
+    if (!filter) return;
+    if (filter.name === 'household-query') householdQuery = filter.value;
+    else householdStatus = filter.value;
+    filterHouseholds();
   });
   app.addEventListener('click', (event) => {
     const target = event.target.closest('[data-shared-action]');
-    if (target) void run(() => act(target.dataset.sharedAction, target.dataset.id));
+    if (!target || busy) return;
+    const {sharedAction, id} = target.dataset;
+    if (sharedAction === 'tab' && hostTab === id) return;
+    if (user && sharedAction !== 'copy' && !confirmDrafts()) return;
+    void run(async () => {
+      await act(sharedAction, id);
+      if (target === document.activeElement || target.isConnected || !user) return;
+      const replacement = Array.from(app.querySelectorAll('[data-shared-action]'))
+        .find((button) => button.dataset.sharedAction === sharedAction && button.dataset.id === id);
+      const focusTarget = replacement ?? app.querySelector('[aria-current="page"]');
+      focusTarget?.focus({preventScroll: true});
+    });
   });
 
   window.addEventListener('hashchange', () => {

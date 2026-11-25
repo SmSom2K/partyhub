@@ -1,0 +1,15 @@
+{
+  "id": "./",
+  "name": "PartyHub Event Workspace",
+  "short_name": "PartyHub",
+  "description": "Manage event details, guest responses, music, and memories.",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#f6f4fa",
+  "theme_color": "#23183f",
+  "icons": [
+    {"src": "assets/partyhub-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any maskable"},
+    {"src": "assets/partyhub-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable"}
+  ]
+}
